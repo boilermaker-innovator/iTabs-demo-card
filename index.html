@@ -1,3 +1,573 @@
+# iTabs Browser Extension Technical Specification
+
+## Overview
+
+The iTabs Browser Extension will enable rich, interactive previews of websites that implement iTabs metadata. This extension will detect when a user hovers over links, fetch and parse the metadata from the destination page, and display a tabbed preview interface without requiring the user to leave their current page.
+
+## Core Functionality
+
+1. **Link Hover Detection**: Monitor mouse hover events on hyperlinks (`<a>` tags)
+2. **Metadata Fetching**: Request and parse iTabs metadata from target URLs
+3. **Preview Rendering**: Generate and display tabbed preview cards
+4. **User Interaction**: Handle tab switching and preview navigation
+5. **Performance Optimization**: Implement caching and prefetching strategies
+
+## Technical Architecture
+
+### Browser Support
+
+- Initial release: Chrome/Edge (Chromium-based browsers)
+- Future expansion: Firefox, Safari
+
+### Components
+
+#### 1. Background Script (`background.js`)
+
+- Maintains extension state and configuration
+- Handles caching of fetched metadata
+- Manages content script injection
+
+```javascript
+// Background script pseudo-code
+chrome.runtime.onInstalled.addListener(() => {
+  // Initialize cache
+  chrome.storage.local.set({ metadata_cache: {} });
+  
+  // Set default configuration
+  chrome.storage.local.set({
+    config: {
+      enabled: true,
+      hoverDelay: 300, // ms
+      cacheDuration: 86400000, // 24 hours in ms
+      prefetchEnabled: true
+    }
+  });
+});
+
+// Handle metadata requests from content script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === "fetchMetadata") {
+    fetchAndCacheMetadata(request.url)
+      .then(metadata => sendResponse({ success: true, metadata }))
+      .catch(error => sendResponse({ success: false, error }));
+    return true; // Keep channel open for async response
+  }
+});
+```
+
+#### 2. Content Script (`content.js`)
+
+- Monitors link hover events
+- Requests metadata from background script
+- Renders preview UI
+
+```javascript
+// Content script pseudo-code
+document.addEventListener('mouseover', event => {
+  // Check if target is a link
+  if (event.target.tagName === 'A' && event.target.href) {
+    const url = event.target.href;
+    
+    // Start hover timer
+    const hoverTimer = setTimeout(() => {
+      // Request metadata
+      chrome.runtime.sendMessage(
+        { action: "fetchMetadata", url },
+        response => {
+          if (response.success && response.metadata.enabled) {
+            renderPreview(event.target, response.metadata);
+          }
+        }
+      );
+    }, config.hoverDelay);
+    
+    // Clear timer on mouseout
+    event.target.addEventListener('mouseout', () => {
+      clearTimeout(hoverTimer);
+      removePreview();
+    }, { once: true });
+  }
+});
+```
+
+#### 3. Metadata Fetcher Module (`metadata-fetcher.js`)
+
+- Requests page HTML
+- Extracts iTabs metadata
+- Formats and validates data
+
+```javascript
+// Metadata fetcher pseudo-code
+async function fetchAndCacheMetadata(url) {
+  // Check cache first
+  const cache = await chrome.storage.local.get('metadata_cache');
+  if (cache.metadata_cache[url] && 
+      (Date.now() - cache.metadata_cache[url].timestamp < config.cacheDuration)) {
+    return cache.metadata_cache[url].data;
+  }
+  
+  // Fetch page HTML
+  const response = await fetch(url);
+  const html = await response.text();
+  
+  // Create DOM parser
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  
+  // Extract iTabs metadata
+  const metadata = extractITabsMetadata(doc);
+  
+  // Update cache
+  if (metadata.enabled) {
+    cache.metadata_cache[url] = {
+      data: metadata,
+      timestamp: Date.now()
+    };
+    await chrome.storage.local.set({ metadata_cache: cache.metadata_cache });
+  }
+  
+  return metadata;
+}
+
+function extractITabsMetadata(doc) {
+  // Initialize metadata object
+  const metadata = {
+    enabled: false,
+    title: '',
+    description: '',
+    image: '',
+    tabs: {}
+  };
+  
+  // Get all meta tags
+  const metaTags = doc.querySelectorAll('meta[name^="itabs:"]');
+  
+  // Process each meta tag
+  metaTags.forEach(tag => {
+    const property = tag.getAttribute('name');
+    const content = tag.getAttribute('content');
+    
+    // Process based on property name
+    if (property === 'itabs:enabled' && content === 'true') {
+      metadata.enabled = true;
+    } else if (property === 'itabs:title') {
+      metadata.title = content;
+    } else if (property === 'itabs:description') {
+      metadata.description = content;
+    } else if (property === 'itabs:image') {
+      metadata.image = content;
+    } else if (property.startsWith('itabs:tab:')) {
+      // Extract tab name (e.g., 'overview' from 'itabs:tab:overview')
+      const tabName = property.replace('itabs:tab:', '');
+      
+      // Handle JSON content if applicable
+      try {
+        // Try to parse as JSON
+        const jsonContent = JSON.parse(content);
+        metadata.tabs[tabName] = jsonContent;
+      } catch (e) {
+        // Not JSON, use as plain text
+        metadata.tabs[tabName] = content;
+      }
+    }
+  });
+  
+  return metadata;
+}
+```
+
+#### 4. Preview UI Renderer (`preview-ui.js`)
+
+- Creates and positions preview card
+- Builds tab interface
+- Handles user interactions
+
+```javascript
+// Preview UI renderer pseudo-code
+function renderPreview(target, metadata) {
+  // Create preview container
+  const preview = document.createElement('div');
+  preview.className = 'itabs-preview';
+  
+  // Position relative to target link
+  positionPreview(preview, target);
+  
+  // Create header with image and title
+  preview.innerHTML = `
+    <div class="itabs-header">
+      ${metadata.image ? `<img src="${metadata.image}" alt="${metadata.title}">` : ''}
+      <div class="itabs-title-container">
+        <h3>${metadata.title}</h3>
+        <p>${metadata.description}</p>
+      </div>
+    </div>
+  `;
+  
+  // Create tab navigation
+  const tabNav = document.createElement('div');
+  tabNav.className = 'itabs-tabs';
+  
+  // Create tab content container
+  const tabContent = document.createElement('div');
+  tabContent.className = 'itabs-tab-content';
+  
+  // Add tabs
+  let isFirst = true;
+  Object.keys(metadata.tabs).forEach(tabName => {
+    // Create tab button
+    const tab = document.createElement('button');
+    tab.className = `itabs-tab ${isFirst ? 'active' : ''}`;
+    tab.textContent = tabName.charAt(0).toUpperCase() + tabName.slice(1);
+    tab.dataset.tab = tabName;
+    tabNav.appendChild(tab);
+    
+    // Create tab content
+    const content = document.createElement('div');
+    content.className = `itabs-content ${isFirst ? 'active' : ''}`;
+    content.dataset.tab = tabName;
+    
+    // Handle different content types
+    if (typeof metadata.tabs[tabName] === 'object') {
+      content.innerHTML = formatObjectContent(metadata.tabs[tabName]);
+    } else {
+      content.textContent = metadata.tabs[tabName];
+    }
+    
+    tabContent.appendChild(content);
+    
+    isFirst = false;
+  });
+  
+  // Add tab navigation and content to preview
+  preview.appendChild(tabNav);
+  preview.appendChild(tabContent);
+  
+  // Add visit link button
+  preview.innerHTML += `
+    <div class="itabs-footer">
+      <a href="${target.href}" class="itabs-visit-link">Visit Page</a>
+    </div>
+  `;
+  
+  // Add to page
+  document.body.appendChild(preview);
+  
+  // Add event listeners for tab switching
+  preview.querySelectorAll('.itabs-tab').forEach(tab => {
+    tab.addEventListener('click', (e) => {
+      const tabName = e.target.dataset.tab;
+      
+      // Deactivate all tabs
+      preview.querySelectorAll('.itabs-tab, .itabs-content').forEach(el => {
+        el.classList.remove('active');
+      });
+      
+      // Activate selected tab
+      preview.querySelector(`.itabs-tab[data-tab="${tabName}"]`).classList.add('active');
+      preview.querySelector(`.itabs-content[data-tab="${tabName}"]`).classList.add('active');
+    });
+  });
+}
+```
+
+#### 5. Popup UI (`popup.html`, `popup.js`)
+
+- Toggle extension on/off
+- Adjust configuration settings
+- View statistics
+
+#### 6. Options Page (`options.html`, `options.js`)
+
+- Detailed configuration options
+- Cache management
+- Customization options
+
+### User Interface Design
+
+#### Preview Card UI
+
+The preview card will include:
+
+1. **Header Section**
+   - Featured image (if available)
+   - Title
+   - Brief description
+
+2. **Tab Navigation**
+   - Horizontally arranged tabs
+   - Active tab indicator
+   - Automatic tab rotation option
+
+3. **Content Area**
+   - Tab-specific content
+   - Support for text, lists, and tables
+   - Properly formatted JSON data
+
+4. **Footer**
+   - Visit link button
+   - Optional share functionality
+   - Branding (iTabs powered)
+
+```css
+/* Core Preview Card Styling */
+.itabs-preview {
+  position: absolute;
+  z-index: 10000;
+  width: 350px;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 5px 20px rgba(0,0,0,0.2);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+  overflow: hidden;
+  animation: itabs-fade-in 0.2s ease-out;
+}
+
+.itabs-header {
+  display: flex;
+  padding: 12px;
+  border-bottom: 1px solid #eee;
+}
+
+.itabs-header img {
+  width: 60px;
+  height: 60px;
+  object-fit: cover;
+  border-radius: 4px;
+  margin-right: 12px;
+}
+
+.itabs-title-container h3 {
+  margin: 0 0 5px 0;
+  font-size: 16px;
+  color: #333;
+}
+
+.itabs-title-container p {
+  margin: 0;
+  font-size: 14px;
+  color: #666;
+}
+
+.itabs-tabs {
+  display: flex;
+  background: #f5f5f5;
+  border-bottom: 1px solid #eee;
+}
+
+.itabs-tab {
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: #666;
+}
+
+.itabs-tab.active {
+  background: white;
+  color: #1a73e8;
+  border-bottom: 2px solid #1a73e8;
+}
+
+.itabs-tab-content {
+  position: relative;
+  min-height: 100px;
+}
+
+.itabs-content {
+  display: none;
+  padding: 12px;
+  font-size: 14px;
+  line-height: 1.4;
+  color: #333;
+}
+
+.itabs-content.active {
+  display: block;
+}
+
+.itabs-footer {
+  padding: 12px;
+  border-top: 1px solid #eee;
+  text-align: right;
+}
+
+.itabs-visit-link {
+  display: inline-block;
+  padding: 8px 12px;
+  background: #1a73e8;
+  color: white;
+  text-decoration: none;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+@keyframes itabs-fade-in {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+```
+
+## Technical Challenges & Solutions
+
+### 1. Cross-Origin Requests
+
+**Challenge**: Fetching metadata from external domains faces cross-origin restrictions.
+
+**Solution**: Use the extension's background script which has broader permissions to make cross-origin requests.
+
+### 2. Performance Impact
+
+**Challenge**: Fetching metadata for every link hover could create performance issues.
+
+**Solutions**:
+- Implement hover delay to prevent unnecessary requests
+- Cache fetched metadata locally
+- Implement intelligent prefetching for links in the viewport
+- Use throttling to limit concurrent requests
+
+### 3. Positioning Logic
+
+**Challenge**: Preview cards must be positioned to avoid going off-screen.
+
+**Solution**: Implement smart positioning logic that detects viewport edges and adjusts accordingly.
+
+```javascript
+function positionPreview(preview, target) {
+  const rect = target.getBoundingClientRect();
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const previewWidth = 350; // Preview card width
+  
+  // Check if there's enough space to the right
+  if (rect.right + previewWidth + 20 <= viewportWidth) {
+    // Position to the right
+    preview.style.left = `${rect.right + 10}px`;
+  } else if (rect.left - previewWidth - 20 >= 0) {
+    // Position to the left
+    preview.style.left = `${rect.left - previewWidth - 10}px`;
+  } else {
+    // Center horizontally if neither side has enough space
+    preview.style.left = `${Math.max(10, Math.min(viewportWidth - previewWidth - 10, rect.left))}px`;
+  }
+  
+  // Check vertical positioning
+  if (rect.top + preview.offsetHeight + 20 <= viewportHeight) {
+    // Position below
+    preview.style.top = `${rect.bottom + 10}px`;
+  } else {
+    // Position above
+    preview.style.top = `${Math.max(10, rect.top - preview.offsetHeight - 10)}px`;
+  }
+}
+```
+
+### 4. Content Security Policies
+
+**Challenge**: Some websites have strict Content Security Policies that might block injection.
+
+**Solution**: Create the preview UI as a shadow DOM element with self-contained styles to avoid CSP conflicts.
+
+### 5. JSON Parsing
+
+**Challenge**: Handling potentially malformed JSON content in metadata.
+
+**Solution**: Implement robust parsing with proper error handling and fallbacks.
+
+## Security Considerations
+
+1. **Content Sanitization**: Sanitize all metadata content to prevent XSS attacks
+2. **URL Validation**: Ensure URLs in metadata are properly validated and sanitized
+3. **Resource Limitations**: Implement timeout limits for metadata fetching
+4. **Permission Scope**: Limit permissions to only what's necessary
+5. **User Control**: Allow users to disable the extension on specific sites
+
+## Privacy Considerations
+
+1. **Data Collection**: Minimize data collection to essential functionality
+2. **Local Storage**: Keep metadata cache local to the user's browser
+3. **Transparency**: Clearly communicate what data is collected and how it's used
+4. **User Control**: Provide options to clear cached data
+
+## Testing Strategy
+
+1. **Unit Tests**: Core functionality components
+2. **Integration Tests**: End-to-end preview generation
+3. **Performance Tests**: Measure impact on page load and interaction
+4. **Compatibility Tests**: Verify functionality across browsers and websites
+5. **Security Audits**: Regular security reviews
+
+## Development Roadmap
+
+### Phase 1: Core Functionality (Weeks 1-2)
+- Basic link hover detection
+- Metadata fetching and parsing
+- Simple preview card rendering
+
+### Phase 2: UI Refinement (Weeks 3-4)
+- Polished preview card design
+- Tab switching animations
+- Mobile-friendly interactions
+
+### Phase 3: Optimization (Weeks 5-6)
+- Caching system
+- Performance improvements
+- Intelligent prefetching
+
+### Phase 4: Advanced Features (Weeks 7-8)
+- Configuration options
+- Statistics tracking
+- Custom styling options
+
+## Distribution Plan
+
+1. **Chrome Web Store**: Primary distribution channel
+2. **Developer Website**: Direct download for testing
+3. **Firefox Add-ons**: Secondary browser support
+4. **Documentation Site**: Implementation guides for websites
+
+## Success Metrics
+
+1. **Adoption Rate**: Number of active installations
+2. **Engagement**: Frequency of preview interactions
+3. **Website Implementation**: Number of sites with iTabs metadata
+4. **User Feedback**: Ratings and reviews
+5. **Performance Impact**: Minimal effect on browsing experience
+
+## Appendix A: Sample Metadata Implementation
+
+```html
+<meta name="itabs:enabled" content="true">
+<meta name="itabs:title" content="Sony WH-1000XM6 Wireless Headphones">
+<meta name="itabs:description" content="Premium noise-cancelling headphones with 30-hour battery life.">
+<meta name="itabs:image" content="https://example.com/sony-headphones.jpg">
+<meta name="itabs:tab:overview" content="The Sony WH-1000XM6 continues Sony's legacy of exceptional noise-cancelling headphones.">
+<meta name="itabs:tab:specs" content="{'noise_cancellation':'Adaptive with pressure sensors','battery':'30 hours','connectivity':'Bluetooth 5.3'}">
+<meta name="itabs:tab:reviews" content="Exceptional sound quality with punchy bass and detailed highs.">
+<meta name="itabs:tab:pricing" content="{'amazon':'379.99','bestbuy':'399.99','walmart':'389.99'}">
+```
+
+## Appendix B: Preview Card Design Mock
+
+```
++----------------------------------+
+|  [IMG]  | Sony WH-1000XM6        |
+|         | Premium noise-cancell...|
++----------------------------------+
+| Overview | Specs | Reviews | Price|
++----------------------------------+
+| The Sony WH-1000XM6 continues    |
+| Sony's legacy of exceptional     |
+| noise-cancelling headphones with |
+| improved drivers and enhanced    |
+| noise cancellation technology.   |
+|                                  |
++----------------------------------+
+|                     [Visit Page] |
++----------------------------------+
+```
+<br>
+<br>
 <!DOCTYPE html>
 <html lang="en">
 <head>
